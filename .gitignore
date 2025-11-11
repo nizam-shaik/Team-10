@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+
+# Virtual environments and secrets
+env/
+.venv/
+venv/
+.env
+
+# Tool caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+output/
+notes/
+env/
