@@ -10,21 +10,35 @@ import numpy as np
 import os
 import pickle
 import logging
-from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
+from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor, VotingRegressor
 from sklearn.model_selection import train_test_split, cross_val_score, GridSearchCV
 from sklearn.metrics import r2_score, mean_squared_error, mean_absolute_error
 from sklearn.preprocessing import StandardScaler
 from sklearn.feature_selection import SelectKBest, f_regression
+from sklearn.svm import SVR
+from sklearn.linear_model import LinearRegression, Ridge, Lasso
 from xgboost import XGBRegressor  # type: ignore
 
 logger = logging.getLogger(__name__)
 
 class LargeScaleMLTrainer:
 	def __init__(self):
+		# Create Linear Regression Ensemble (Voting Regressor with Linear, Ridge, Lasso)
+		# Using stronger regularization to prevent overfitting
+		linear_ensemble = VotingRegressor(
+			estimators=[
+				('linear', LinearRegression()),
+				('ridge', Ridge(alpha=100.0, random_state=42)),   # Stronger regularization
+				('lasso', Lasso(alpha=10.0, random_state=42, max_iter=10000))  # Stronger regularization
+			]
+		)
+		
 		self.models = {
 			'RandomForest': RandomForestRegressor(random_state=42),
 			'GradientBoosting': GradientBoostingRegressor(random_state=42),
-			'XGBoost': XGBRegressor(random_state=42)
+			'XGBoost': XGBRegressor(random_state=42),
+			'SupportVectorRegressor': SVR(kernel='rbf'),
+			'LinearEnsemble': linear_ensemble
 		}
 		self.results = {}
 		self.df = None
@@ -63,6 +77,41 @@ class LargeScaleMLTrainer:
 			logger.error(f"❌ Dataset missing 'quality_score' target column")
 			raise ValueError("Dataset must contain 'quality_score' column")
 		
+		# Validate problem type: Check if target is suitable for regression
+		logger.info("🔍 Validating problem type...")
+		target = self.df['quality_score']
+		
+		# Check if target is numeric
+		if not pd.api.types.is_numeric_dtype(target):
+			logger.error(f"❌ Target 'quality_score' must be numeric for regression")
+			logger.error(f"   Current dtype: {target.dtype}")
+			raise ValueError("Target variable must be numeric for regression models")
+		
+		# Determine if it's regression or classification based on target characteristics
+		unique_values = target.nunique()
+		total_values = len(target)
+		unique_ratio = unique_values / total_values
+		
+		logger.info(f"   Target variable analysis:")
+		logger.info(f"     - Unique values: {unique_values}")
+		logger.info(f"     - Total values: {total_values}")
+		logger.info(f"     - Unique ratio: {unique_ratio:.4f}")
+		logger.info(f"     - Data type: {target.dtype}")
+		logger.info(f"     - Value range: [{target.min():.2f}, {target.max():.2f}]")
+		
+		# Classification warning: if unique values < 20 and unique_ratio < 0.05
+		if unique_values < 20 and unique_ratio < 0.05:
+			logger.warning(f"   ⚠️  WARNING: Target has only {unique_values} unique values")
+			logger.warning(f"   ⚠️  This looks like a CLASSIFICATION problem, but using REGRESSION models")
+			logger.warning(f"   ⚠️  Consider using classification models instead for better results")
+			logger.info(f"   📋 Unique target values: {sorted(target.unique())}")
+		elif unique_ratio > 0.05:
+			logger.info(f"   ✅ Problem type: REGRESSION (continuous target)")
+			logger.info(f"   ✅ Appropriate for regression models")
+		else:
+			logger.info(f"   ℹ️  Problem type: REGRESSION (discrete but sufficient unique values)")
+		
+		logger.info("")
 		logger.info(f"✅ Dataset validation passed")
 		logger.info(f"   Feature columns: {self.df.shape[1] - 1}")
 		logger.info(f"   Target column: quality_score")
@@ -133,19 +182,55 @@ class LargeScaleMLTrainer:
 		
 		# Correlation matrix (top features)
 		logger.info("")
-		logger.info("📈 Building correlation matrix for top 15 features...")
-		# Get top 15 features by absolute correlation
+		logger.info("📈 Building correlation matrix for significant features...")
+		
+		# Select features based on correlation threshold (not arbitrary count)
+		correlation_threshold = 0.1  # Only include features with |correlation| > 0.1
 		sorted_features = sorted(correlations.items(), key=lambda x: abs(x[1]), reverse=True)
-		top_features = [feat_name for feat_name, _ in sorted_features[:15]]
+		
+		# Filter features by threshold
+		significant_features = [feat_name for feat_name, corr in sorted_features if abs(corr) >= correlation_threshold]
+		
+		# Store significant features for use in prepare_data()
+		self.eda_stats['significant_features'] = significant_features
+		self.eda_stats['correlation_threshold'] = correlation_threshold
+		
+		# Limit to top 20 if too many significant features
+		max_features_for_matrix = 20
+		if len(significant_features) > max_features_for_matrix:
+			top_features = significant_features[:max_features_for_matrix]
+			logger.info(f"   Found {len(significant_features)} features with |correlation| >= {correlation_threshold}")
+			logger.info(f"   Limiting to top {max_features_for_matrix} for correlation matrix")
+		else:
+			top_features = significant_features
+			logger.info(f"   Found {len(significant_features)} features with |correlation| >= {correlation_threshold}")
+		
+		# Fallback: if no significant features, use top 5
+		if len(top_features) == 0:
+			logger.warning(f"   ⚠️  No features found with |correlation| >= {correlation_threshold}")
+			logger.warning(f"   Using top 5 features by absolute correlation as fallback")
+			top_features = [feat_name for feat_name, _ in sorted_features[:5]]
+			self.eda_stats['significant_features'] = [feat_name for feat_name, _ in sorted_features]  # Store all for fallback
 		
 		self.correlation_matrix = self.df[top_features + ['quality_score']].corr()
 		logger.info(f"   Correlation matrix shape: {self.correlation_matrix.shape}")
 		
-		# Outlier detection (IQR method)
+		# Outlier detection (IQR method) - use significant features, not arbitrary first 10
 		logger.info("")
-		logger.info("🔍 Detecting outliers (IQR method) in top 10 features...")
+		logger.info("🔍 Detecting outliers (IQR method) in significant features...")
+		
+		# Use significant features for outlier detection (limit to top 15 for performance)
+		features_to_check = significant_features[:15] if len(significant_features) > 15 else significant_features
+		
+		if len(features_to_check) == 0:
+			logger.warning("   ⚠️  No significant features to check for outliers")
+			features_to_check = sorted_features[:5] if len(sorted_features) >= 5 else [f[0] for f in sorted_features]
+			logger.info(f"   Using top {len(features_to_check)} features by correlation as fallback")
+		else:
+			logger.info(f"   Checking {len(features_to_check)} significant features for outliers")
+		
 		outliers = {}
-		for feature in features[:10]:  # Check top 10 features
+		for feature in features_to_check:
 			Q1 = self.df[feature].quantile(0.25)
 			Q3 = self.df[feature].quantile(0.75)
 			IQR = Q3 - Q1
@@ -186,38 +271,76 @@ class LargeScaleMLTrainer:
 		
 		# Feature Selection
 		if use_feature_selection:
-			logger.info("🎯 Performing feature selection (SelectKBest)...")
-			k_features = min(25, len(features))
-			logger.info(f"   Selecting top {k_features} features out of {len(features)}")
+			logger.info("🎯 Performing feature selection (combining EDA correlation + F-score analysis)...")
 			
-			selector = SelectKBest(score_func=f_regression, k=k_features)
+			# Get significant features from EDA (correlation-based)
+			eda_significant_features = self.eda_stats.get('significant_features', [])
+			correlation_threshold = self.eda_stats.get('correlation_threshold', 0.1)
 			
-			logger.info(f"   Fitting selector on training data...")
-			X_train_selected = selector.fit_transform(self.X_train, self.y_train)
-			selected_mask = selector.get_support()
-			selected_columns = self.X_train.columns[selected_mask]
+			if len(eda_significant_features) > 0:
+				logger.info(f"   📊 EDA identified {len(eda_significant_features)} features with |correlation| >= {correlation_threshold}")
+			else:
+				logger.warning("   ⚠️  No significant features found in EDA - will use F-score analysis only")
 			
-			self.X_train = pd.DataFrame(
-				X_train_selected,
-				columns=selected_columns,
-				index=self.X_train.index
-			)
-			self.X_test = pd.DataFrame(
-				selector.transform(self.X_test),
-				columns=selected_columns,
-				index=self.X_test.index
-			)
-			self.selected_features = list(self.X_train.columns)
+			# Compute F-scores for statistical validation
+			logger.info(f"   📈 Computing F-scores for statistical validation...")
+			selector_full = SelectKBest(score_func=f_regression, k='all')
+			selector_full.fit(self.X_train, self.y_train)
 			
-			logger.info(f"   ✅ Selected {len(self.selected_features)} features")
-			logger.info(f"   Top 10 selected features: {self.selected_features[:10]}")
-			
-			# Log feature scores
-			feature_scores = dict(zip(features, selector.scores_))
+			# Get F-scores for all features
+			feature_scores = dict(zip(features, selector_full.scores_))
 			sorted_scores = sorted(feature_scores.items(), key=lambda x: x[1], reverse=True)
-			logger.info(f"   Top 5 features by F-score:")
-			for feat_name, score in sorted_scores[:5]:
-				logger.info(f"     - {feat_name}: {score:.2f}")
+			
+			# Define F-score threshold
+			f_score_threshold = 10.0
+			significant_features_by_fscore = [feat for feat, score in sorted_scores if score >= f_score_threshold]
+			logger.info(f"   📈 F-score analysis identified {len(significant_features_by_fscore)} features with F-score >= {f_score_threshold}")
+			
+			# Determine which features to select based on combined analysis
+			features_to_select = []
+			
+			if len(eda_significant_features) > 0 and len(significant_features_by_fscore) > 0:
+				# Intersection: features significant in both analyses
+				intersection = list(set(eda_significant_features) & set(significant_features_by_fscore))
+				logger.info(f"   🔗 Combined analysis: {len(intersection)} features pass BOTH thresholds")
+				
+				if len(intersection) > 0:
+					features_to_select = intersection[:30]  # Cap at 30
+					logger.info(f"   ✅ Using {len(features_to_select)} features from intersection")
+				else:
+					# Union fallback: features significant in either
+					union = list(set(eda_significant_features) | set(significant_features_by_fscore))
+					features_to_select = union[:30]
+					logger.warning(f"   ⚠️  No features passed both thresholds")
+					logger.warning(f"   Using {len(features_to_select)} features from union")
+			elif len(eda_significant_features) > 0:
+				features_to_select = eda_significant_features[:30]
+				logger.info(f"   Using {len(features_to_select)} correlation-significant features")
+			elif len(significant_features_by_fscore) > 0:
+				features_to_select = significant_features_by_fscore[:30]
+				logger.info(f"   Using {len(features_to_select)} F-score-significant features")
+			else:
+				# Final fallback: top 10 by F-score
+				features_to_select = [feat for feat, _ in sorted_scores[:10]]
+				logger.warning(f"   ⚠️  No significant features found in either analysis")
+				logger.warning(f"   Using top {len(features_to_select)} features by F-score")
+			
+			# Now manually select these features (no need for SelectKBest again)
+			logger.info(f"   Selecting {len(features_to_select)} features...")
+			
+			self.X_train = self.X_train[features_to_select]
+			self.X_test = self.X_test[features_to_select]
+			self.selected_features = features_to_select
+			
+			logger.info(f"   ✅ Selected {len(self.selected_features)} features out of {len(features)}")
+			logger.info(f"   Selected features: {self.selected_features[:10]}{'...' if len(self.selected_features) > 10 else ''}")
+			
+			# Log top 5 features with both metrics
+			logger.info(f"   📊 Top 5 selected features:")
+			for feat_name in self.selected_features[:5]:
+				f_score = feature_scores.get(feat_name, 0.0)
+				corr = self.eda_stats['feature_correlations'].get(feat_name, 0.0)
+				logger.info(f"     - {feat_name}: F={f_score:.2f}, Corr={corr:.4f}")
 			logger.info("")
 		else:
 			self.selected_features = features
@@ -268,6 +391,7 @@ class LargeScaleMLTrainer:
 		logger.info(f"Training data shape: {self.X_train_scaled.shape}")
 		logger.info(f"Cross-validation: {'Enabled (5-fold)' if use_cross_validation else 'Disabled'}")
 		logger.info("")
+		logger.info(self.X_train_scaled.head())
 		
 		# Convert models dict to list to avoid modification during iteration
 		model_items = list(self.models.items())
@@ -326,48 +450,6 @@ class LargeScaleMLTrainer:
 		logger.info("=" * 80)
 		logger.info("")
 
-	def tune_hyperparameters(self, model_name='RandomForest', param_grid=None):
-		"""Hyperparameter tuning using GridSearchCV"""
-		logger.info(f"Tuning hyperparameters for {model_name}...")
-		
-		if param_grid is None:
-			# Default parameter grids
-			param_grids = {
-				'RandomForest': {
-					'n_estimators': [100, 200],
-					'max_depth': [10, 20, None],
-					'min_samples_split': [2, 5]
-				},
-				'GradientBoosting': {
-					'n_estimators': [100, 200],
-					'learning_rate': [0.01, 0.1],
-					'max_depth': [3, 5]
-				},
-				'XGBoost': {
-					'n_estimators': [100, 200],
-					'learning_rate': [0.01, 0.1],
-					'max_depth': [3, 5]
-				}
-			}
-			param_grid = param_grids.get(model_name, {})
-		
-		if not param_grid:
-			logger.warning(f"No parameter grid provided for {model_name}")
-			return
-		
-		model = self.models[model_name]
-		grid_search = GridSearchCV(
-			model, param_grid, cv=3, scoring='r2', n_jobs=-1, verbose=1
-		)
-		grid_search.fit(self.X_train_scaled, self.y_train)
-		
-		logger.info(f"Best parameters for {model_name}: {grid_search.best_params_}")
-		logger.info(f"Best CV score: {grid_search.best_score_:.4f}")
-		
-		# Update model with best parameters
-		self.models[model_name] = grid_search.best_estimator_
-		
-		return grid_search.best_params_, grid_search.best_score_
 
 	def evaluate_models(self):
 		"""Evaluate all trained models on test set"""
