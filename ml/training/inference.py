@@ -120,14 +120,25 @@ class HLDQualityPredictor:
 						)
 						logger.info(f"Applied scaling for {name}")
 					
-					preds[name] = float(model.predict(X_input)[0])
+					raw_pred = float(model.predict(X_input)[0])
+					# Clip predictions to 0-100 range (quality score range)
+					preds[name] = max(0.0, min(100.0, raw_pred))
+					
+					if raw_pred != preds[name]:
+						logger.warning(f"{name} predicted {raw_pred:.2f}, clipped to {preds[name]:.2f}")
+					
 				except Exception as e:
 					# Fallback to numpy array
 					logger.warning(f"DataFrame prediction failed for {name}, using numpy: {e}")
 					X_input = np.array([row_base.get(fn, 0.0) for fn in feature_list]).reshape(1, -1)
 					if self.scaler is not None:
 						X_input = self.scaler.transform(X_input)
-					preds[name] = float(model.predict(X_input)[0])
+					raw_pred = float(model.predict(X_input)[0])
+					# Clip predictions to 0-100 range
+					preds[name] = max(0.0, min(100.0, raw_pred))
+					
+					if raw_pred != preds[name]:
+						logger.warning(f"{name} predicted {raw_pred:.2f}, clipped to {preds[name]:.2f}")
 				
 				logger.info(f"Prediction from {name}: {preds[name]}")
 			except Exception as e:
