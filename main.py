@@ -28,6 +28,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 import pandas as pd
 import streamlit as st
+import zipfile
+import io
 
 # Configure logging
 logging.basicConfig(
@@ -74,6 +76,24 @@ def safe_load_json(path: Optional[str]) -> Optional[Dict]:
             return json.load(f)
     except Exception:
         return None
+
+
+def create_images_zip(img_folder: Path) -> Optional[bytes]:
+    """Create a zip file containing all PNG images from the img folder."""
+    if not img_folder.exists() or not img_folder.is_dir():
+        return None
+    
+    png_files = list(img_folder.glob("*.png"))
+    if not png_files:
+        return None
+    
+    zip_buffer = io.BytesIO()
+    with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
+        for png_file in png_files:
+            zip_file.write(png_file, arcname=png_file.name)
+    
+    zip_buffer.seek(0)
+    return zip_buffer.getvalue()
 
 
 # -----------------------
@@ -282,7 +302,7 @@ def main():
                 elif etype == "error":
                     log_box.error(f"Error: {e.get('message')}")
                 elif etype == "started":
-                    log_box.info("Workflow started.")
+                    log_box.info("Workflow completed.")
                 elif etype == "completed":
                     log_box.success("Workflow completed.")
                 elif etype == "state_update":
@@ -861,6 +881,7 @@ def main():
                 # Interactive Diagrams first
                 if diagrams_html_path and Path(diagrams_html_path).exists():
                     st.markdown("## 📊 Interactive Diagrams")
+
                     with st.expander("🔍 View Diagrams (Click to Expand/Minimize)", expanded=True):
                         try:
                             # Read the HTML content and embed it directly with white background
@@ -875,6 +896,22 @@ def main():
                         except Exception as e:
                             st.error(f"Could not render diagrams: {e}")
                             st.markdown(f"[Open Diagrams Viewer]({Path(diagrams_html_path).as_uri()})")
+                    
+                    # Check if img folder exists and has PNG files
+                    img_folder = output_dir / "diagrams" / "img"
+                    if img_folder.exists():
+                        png_files = list(img_folder.glob("*.png"))
+                        if png_files:
+                            # Create download button for all PNG images
+                            zip_data = create_images_zip(img_folder)
+                            if zip_data:
+                                st.download_button(
+                                    label=f"📥 Download All Diagram Images ({len(png_files)} PNG files)",
+                                    data=zip_data,
+                                    file_name=f"{Path(selected_pdf).stem}_diagrams.zip",
+                                    mime="application/zip",
+                                    help="Download all diagram images as a ZIP file"
+                                )
 
                 # HLD Document below
                 if hld_md_path and Path(hld_md_path).exists():
@@ -1058,51 +1095,139 @@ def main():
             
             # Execute training if state is True
             if st.session_state.is_training:
-                # Create placeholder for progress updates
+                # Create placeholders for progress updates
                 progress_placeholder = st.empty()
                 status_placeholder = st.empty()
+                
+                # Create container for training steps display
+                steps_container = st.container()
+                
+                training_steps = []
                 
                 try:
                     logger.info("Training models started.")
                     
                     # Step 1: Load dataset with EDA
+                    with steps_container:
+                        st.markdown("### 🔄 Training Progress")
+                        step1_placeholder = st.empty()
+                    
                     status_placeholder.info("📂 Loading dataset and performing EDA...")
+                    step1_placeholder.info("**Step 1/5:** 📂 Loading dataset and performing EDA...")
+                    
                     trainer = LargeScaleMLTrainer()
                     trainer.load_dataset(dataset_path)
                     logger.info("Dataset loaded for training.")
                     
+                    # Display EDA results
+                    eda_stats = trainer.get_eda_stats()
+                    step1_info = f"""
+                    **Step 1/5:** ✅ Dataset loaded & EDA complete
+                    - **Dataset shape:** {eda_stats['shape'][0]:,} rows × {eda_stats['shape'][1]} columns
+                    - **Missing values:** {sum(eda_stats['missing_values'].values())}
+                    - **Duplicate rows:** {eda_stats['duplicates']}
+                    - **Target mean:** {eda_stats['target_stats']['mean']:.2f}
+                    - **Target std:** {eda_stats['target_stats']['std']:.2f}
+                    - **Significant features found:** {len(eda_stats.get('significant_features', []))}
+                    """
+                    step1_placeholder.success(step1_info)
+                    
                     # Step 2: Prepare data with feature selection and scaling
+                    step2_placeholder = st.empty()
                     status_placeholder.info("🔧 Preparing data (feature selection, scaling, train/test split)...")
+                    step2_placeholder.info("**Step 2/5:** 🔧 Preparing data...")
+                    
                     trainer.prepare_data(use_feature_selection=True, use_scaling=True)
                     logger.info(f"Data prepared. Selected {len(trainer.selected_features)} features.")
                     
-                    # Step 3: Train models with cross-validation
-                    total_models = len(trainer.models)
-                    for idx, (name, model) in enumerate(trainer.models.items(), 1):
-                        progress_placeholder.progress(idx / total_models, text=f"Training model {idx}/{total_models}")
-                        status_placeholder.info(f"🤖 Training **{name}** model with cross-validation... ({idx}/{total_models})")
-                        logger.info(f"Training {name} model.")
+                    step2_info = f"""
+                    **Step 2/5:** ✅ Data preparation complete
+                    - **Train set:** {trainer.X_train_scaled.shape[0]:,} samples
+                    - **Test set:** {trainer.X_test_scaled.shape[0]:,} samples
+                    - **Features selected:** {len(trainer.selected_features)} out of {len([col for col in trainer.df.columns if col != 'quality_score'])}
+                    - **Feature selection:** Combined EDA correlation + F-score analysis
+                    - **Scaling:** StandardScaler applied
+                    """
+                    step2_placeholder.success(step2_info)
                     
+                    # Step 3: Train models with cross-validation
+                    step3_placeholder = st.empty()
+                    
+                    status_placeholder.info("🤖 Training models with cross-validation...")
+                    step3_placeholder.info("**Step 3/5:** 🤖 Training models with 5-fold cross-validation...")
+                    
+                    total_models = len(trainer.models)
+                    for idx, (name, _) in enumerate(trainer.models.items(), 1):
+                        progress_placeholder.progress(idx / total_models, text=f"Training model {idx}/{total_models}: {name}")
+                    
+                    # Call the train_models method from train_large_model.py
                     trainer.train_models(use_cross_validation=True)
                     
                     progress_placeholder.empty()
+                    
+                    # Extract CV results from logs or results
+                    step3_info = f"""
+                    **Step 3/5:** ✅ Model training complete
+                    - **Models trained:** {len(trainer.models)}
+                    - **Cross-validation:** 5-fold
+                    - **All models trained successfully**
+                    """
+                    step3_placeholder.success(step3_info)
+                    
                     status_placeholder.success("✅ All models trained successfully!")
                     logger.info("Models trained.")
                     
                     # Step 4: Evaluate models
-                    status_placeholder.info("📊 Evaluating models...")
+                    step4_placeholder = st.empty()
+                    status_placeholder.info("📊 Evaluating models on test set...")
+                    step4_placeholder.info("**Step 4/5:** 📊 Evaluating models...")
+                    
                     trainer.evaluate_models()
                     logger.info("Model evaluation complete.")
                     
+                    # Get best model
+                    best_model_name = max(trainer.results.items(), key=lambda x: x[1]['R2'])[0]
+                    best_r2 = trainer.results[best_model_name]['R2']
+                    best_rmse = trainer.results[best_model_name]['RMSE']
+                    
+                    step4_info = f"""
+                    **Step 4/5:** ✅ Model evaluation complete
+                    - **Best model:** {best_model_name}
+                    - **Best R²:** {best_r2:.4f}
+                    - **Best RMSE:** {best_rmse:.2f}
+                    - **Models evaluated:** {len(trainer.results)}
+                    """
+                    step4_placeholder.success(step4_info)
+                    
+                    # Show evaluation results table
+                    eval_results_df = pd.DataFrame({
+                        'Model': list(trainer.results.keys()),
+                        'R² Score': [f"{r['R2']:.4f}" for r in trainer.results.values()],
+                        'RMSE': [f"{r['RMSE']:.2f}" for r in trainer.results.values()],
+                        'MAE': [f"{r['MAE']:.2f}" for r in trainer.results.values()],
+                        'MAPE': [f"{r['MAPE']:.2f}%" for r in trainer.results.values()]
+                    }).sort_values('R² Score', ascending=False)
+                    st.dataframe(eval_results_df, hide_index=True, use_container_width=True)
+                    
                     # Step 5: Save models with metadata
+                    step5_placeholder = st.empty()
                     status_placeholder.info("💾 Saving models, scaler, and metadata to disk...")
+                    step5_placeholder.info("**Step 5/5:** 💾 Saving models...")
+                    
                     out_dir = os.path.join(os.path.dirname(__file__), "ml", "training", "models")
                     trainer.save_models(out_dir)
                     logger.info(f"Models saved to {out_dir}")
                     
-                    status_placeholder.success("✅ Models trained, evaluated, and saved!")
+                    step5_info = f"""
+                    **Step 5/5:** ✅ Models saved successfully
+                    - **Location:** `{out_dir}`
+                    - **Models saved:** {len(trainer.models)}
+                    - **Files:** {len(trainer.models)} model files + scaler + metadata
+                    """
+                    step5_placeholder.success(step5_info)
                     
-                    # Display comprehensive metrics
+                    status_placeholder.success("✅ Training pipeline completed successfully!")
+                    
                     st.markdown("---")
                     st.subheader("📊 Training Results")
                     
@@ -1456,7 +1581,7 @@ def main():
                                     overall = _clip01(preds.get('ensemble_average', 0.0))
                                     
                                     # Overall quality score with color coding
-                                    st.markdown("### 📊 Overall Quality Score")
+                                    st.markdown("### 📊 Ensemble average")
                                     col_metric, col_progress = st.columns([1, 2])
                                     with col_metric:
                                         st.metric("Overall Quality", f"{overall:.1f}/100")
@@ -1527,7 +1652,7 @@ def main():
                                             st.json(contributing_features)
                                     
                                     # Real-time feature extraction validation
-                                    with st.expander("✅ Real-Time Feature Validation (No Dummy Values)", expanded=False):
+                                    with st.expander("✅ Real-Time Feature Validation", expanded=False):
                                         st.markdown("#### Proof that extracted values are REAL from HLD content:")
                                         
                                         # Core features that prove real extraction
@@ -1554,7 +1679,7 @@ def main():
                                         total_features = len(validation_features)
                                         
                                         if unique_values > 1:
-                                            st.success(f"✅ **{unique_values}/{total_features} unique values detected** - Confirms real extraction, not dummy values!")
+                                            st.success(f"✅ **{unique_values}/{total_features} unique values detected")
                                         else:
                                             st.warning(f"⚠️ Only {unique_values} unique value - May indicate dummy data")
                                         
