@@ -143,3 +143,4 @@ class RuleBasedQualityScorer:
 
 	def identify_missing_elements(self, markdown: str) -> List[str]:
 		return [s for s in self.required_sections if s not in markdown.lower()]
+
